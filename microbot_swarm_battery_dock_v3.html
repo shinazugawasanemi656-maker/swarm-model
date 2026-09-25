@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Microbot Swarm - Battery & Dock Simulation</title>
+<style>
+  :root {
+    --bg: #0b0f14;
+    --surface: #161c24;
+    --border: #2a323d;
+    --text: #e8edf2;
+    --text-secondary: #8a97a3;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px;
+    background: #0e131a;
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--text-secondary); font-size: 13px; margin: 0 0 20px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+  button {
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button:hover { border-color: #378ADD; }
+  .sliders { display: flex; gap: 24px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+  .slider-group { display: flex; align-items: center; gap: 10px; }
+  .slider-group label { font-size: 13px; color: var(--text-secondary); min-width: 90px; }
+  .slider-group span { font-size: 13px; font-weight: 600; min-width: 30px; }
+  input[type=range] { width: 140px; }
+  canvas { display: block; width: 100%; height: 340px; border-radius: 12px; border: 1px solid var(--border); background: #0b0f14; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px,1fr)); gap: 12px; margin-top: 16px; }
+  .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+  .stat-card p:first-child { font-size: 12px; color: var(--text-secondary); margin: 0 0 4px; }
+  .stat-card p:last-child { font-size: 20px; font-weight: 600; margin: 0; }
+  .note { font-size: 12px; color: var(--text-secondary); margin: 0 0 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Microbot Swarm - Battery &amp; Charging Dock Simulation</h1>
+  <p class="sub">Grid / circle / line / hand formations, search-and-explore wandering, per-bot battery with regenerative charging, and a 4-slot charging dock with a waiting queue.</p>
+
+  <div class="controls">
+    <button id="btn-grid" data-f="grid">Grid</button>
+    <button id="btn-circle" data-f="circle">Circle</button>
+    <button id="btn-line" data-f="line">Line</button>
+    <button id="btn-hand" data-f="hand">Hand</button>
+    <button id="btn-search" data-f="search">Search and explore</button>
+  </div>
+
+  <div class="sliders">
+    <div class="slider-group">
+      <label>Bots</label>
+      <input type="range" min="20" max="120" step="10" value="60" id="count" />
+      <span id="count-out">60</span>
+    </div>
+    <div class="slider-group">
+      <label>Speed</label>
+      <input type="range" min="1" max="10" step="1" value="6" id="speed" />
+      <span id="speed-out">6</span>
+    </div>
+    <div class="slider-group">
+      <label>Drain rate</label>
+      <input type="range" min="1" max="10" step="1" value="4" id="drain" />
+      <span id="drain-out">4</span>
+    </div>
+  </div>
+
+  <p class="note">Dock (bottom-left) has 4 charging pads. When all pads are busy, low-battery bots queue nearby and move to a pad as soon as one frees up. The ring around each bot shows its battery level (green/yellow/red); a brief green flash means it just recovered a tiny bit of charge from regenerative braking. Time is compressed ~60x so a realistic ~4-hour run cycle (default drain setting) plays out in about 4 real minutes; the "Sim. time elapsed" stat tracks simulated time, not wall-clock time.</p>
+
+  <canvas id="swarm"></canvas>
+
+  <div class="stats">
+    <div class="stat-card"><p>Avg battery</p><p id="stat-batt">100%</p></div>
+    <div class="stat-card"><p>Charging (max 4)</p><p id="stat-charging">0 / 4</p></div>
+    <div class="stat-card"><p>Waiting in queue</p><p id="stat-queue">0</p></div>
+    <div class="stat-card"><p>Regen recovered</p><p id="stat-regen">0%</p></div>
+    <div class="stat-card"><p>Sim. time elapsed</p><p id="stat-simtime">0h 00m</p></div>
+  </div>
+</div>
+
+<script>
+(function(){
+  var canvas = document.getElementById('swarm');
+  var ctx = canvas.getContext('2d');
+  var W, H;
+  function resize(){
+    var r = canvas.getBoundingClientRect();
+    W = canvas.width = r.width * devicePixelRatio;
+    H = canvas.height = r.height * devicePixelRatio;
+    computeRadius();
+    buildSlotsAndAssign();
+  }
+
+  var countInput = document.getElementById('count');
+  var speedInput = document.getElementById('speed');
+  var drainInput = document.getElementById('drain');
+  var countOut = document.getElementById('count-out');
+  var speedOut = document.getElementById('speed-out');
+  var drainOut = document.getElementById('drain-out');
+  var statBatt = document.getElementById('stat-batt');
+  var statCharging = document.getElementById('stat-charging');
+  var statQueue = document.getElementById('stat-queue');
+  var statRegen = document.getElementById('stat-regen');
+  var statSimtime = document.getElementById('stat-simtime');
+
+  var FORMS = ['grid','circle','line','hand','search'];
+  var formation = 'search';
+  FORMS.forEach(function(f){
+    document.getElementById('btn-' + f).addEventListener('click', function(){
+      formation = f;
+      buildSlotsAndAssign();
+      updateButtons();
+    });
+  });
+  function updateButtons(){
+    FORMS.forEach(function(f){
+      var b = document.getElementById('btn-' + f);
+      b.style.borderColor = (f === formation) ? '#378ADD' : '';
+      b.style.color = (f === formation) ? '#185FA5' : '';
+    });
+  }
+  updateButtons();
+
+  var bots = [];
+  var N = parseInt(countInput.value, 10);
+  var speedMul = parseInt(speedInput.value, 10);
+  var drainLevel = parseInt(drainInput.value, 10);
+  var botRadius = 6;
+  var totalRegen = 0;
+  var DOCK_SLOTS = 4;
+  var slotOccupant = [null, null, null, null];
+
+  function computeRadius(){
+    var w = W || 800, h = H || 340;
+    botRadius = Math.max(3, Math.min(10, Math.sqrt((w * h) / (N * 24))));
+  }
+
+  function boundsFor(shape){
+    var w = W || 800, h = H || 340;
+    var cx = w / 2, cy = h / 2;
+    var cell = botRadius * 3.2;
+    var maxBw = w * 0.44, maxBh = h * 0.42;
+    var bw, bh;
+    if (shape === 'grid'){
+      var aspect = w / h;
+      var neededArea = N * cell * cell;
+      var boxH = Math.sqrt(neededArea / aspect);
+      var boxW = boxH * aspect;
+      bw = Math.min(maxBw, boxW / 2);
+      bh = Math.min(maxBh, boxH / 2);
+    } else if (shape === 'circle'){
+      var radiusNeeded = (N * cell) / (2 * Math.PI);
+      var r = Math.min(Math.min(maxBw, maxBh), Math.max(radiusNeeded, cell));
+      bw = r; bh = r;
+    } else if (shape === 'line'){
+      var lengthNeeded = (N - 1) * cell;
+      bw = Math.min(maxBw, Math.max(lengthNeeded / 2, cell));
+      bh = botRadius * 2;
+    } else if (shape === 'hand'){
+      var aspectH = 0.78;
+      var neededAreaH = N * cell * cell * 1.35;
+      var boxHh = Math.sqrt(neededAreaH / aspectH);
+      var boxWh = boxHh * aspectH;
+      bw = Math.min(maxBw, boxWh / 2);
+      bh = Math.min(maxBh, boxHh / 2);
+    } else {
+      var searchArea = N * cell * cell * 2.2;
+      var aspect2 = w / h;
+      var boxH2 = Math.sqrt(searchArea / aspect2);
+      var boxW2 = boxH2 * aspect2;
+      bw = Math.min(maxBw, boxW2 / 2);
+      bh = Math.min(maxBh, boxH2 / 2);
+    }
+    bw = Math.max(bw, botRadius * 3);
+    bh = Math.max(bh, botRadius * 3);
+    return { cx: cx, cy: cy - h * 0.03, bw: bw, bh: bh, minX: cx - bw, maxX: cx + bw, minY: cy - h*0.03 - bh, maxY: cy - h*0.03 + bh };
+  }
+
+  function dockAnchor(){
+    var w = W || 800, h = H || 340;
+    return { x: w * 0.1, y: h * 0.88 };
+  }
+  function dockSlotPos(idx){
+    var a = dockAnchor();
+    var spacing = botRadius * 2.6;
+    var startX = a.x - spacing * 1.5;
+    return { x: startX + idx * spacing, y: a.y };
+  }
+  function queueAnchor(){
+    var a = dockAnchor();
+    return { x: a.x, y: a.y - botRadius * 6 };
+  }
+
+  function initBots(){
+    computeRadius();
+    bots = [];
+    totalRegen = 0;
+    simElapsed = 0;
+    slotOccupant = [null, null, null, null];
+    for (var i = 0; i < N; i++){
+      bots.push({
+        id: i,
+        x: (W || 800) / 2 + (Math.random()-0.5) * 40, y: (H || 340) / 2 + (Math.random()-0.5) * 40,
+        vx: 0, vy: 0,
+        tx: 0, ty: 0,
+        special: (i % 8 === 0),
+        wobbleAng: Math.random() * Math.PI * 2,
+        wobbleR: Math.random(),
+        battery: 60 + Math.random() * 40,
+        charging: false,
+        waiting: false,
+        dockSlot: -1,
+        prevSpeed: 0,
+        regenFlash: 0
+      });
+    }
+    buildSlotsAndAssign();
+  }
+
+  function handSlots(bd){
+    var fingers = [
+      { base: [0.14, 0.56], tip: [0.02, 0.34] },
+      { base: [0.27, 0.42], tip: [0.23, 0.05] },
+      { base: [0.41, 0.39], tip: [0.40, -0.03] },
+      { base: [0.55, 0.40], tip: [0.57, 0.03] },
+      { base: [0.69, 0.45], tip: [0.79, 0.20] }
+    ];
+    var lens = fingers.map(function(f){
+      var dx = f.tip[0]-f.base[0], dy = f.tip[1]-f.base[1];
+      return Math.sqrt(dx*dx+dy*dy);
+    });
+    var totalLen = lens.reduce(function(a,v){return a+v;},0);
+    var fingerBudget = Math.round(N * 0.55);
+    var fingerCounts = lens.map(function(l){ return Math.max(2, Math.round(fingerBudget * (l/totalLen))); });
+    var usedForFingers = fingerCounts.reduce(function(a,v){return a+v;},0);
+    var palmCount = Math.max(6, N - usedForFingers);
+    var pts = [];
+    fingers.forEach(function(f, idx){
+      var cnt = fingerCounts[idx];
+      for (var k = 0; k < cnt; k++){
+        var t = 0.18 + (k / Math.max(1, cnt - 1)) * 0.82;
+        pts.push({ u: f.base[0] + (f.tip[0]-f.base[0]) * t, v: f.base[1] + (f.tip[1]-f.base[1]) * t });
+      }
+    });
+    var palmTop = 0.40, palmBottom = 0.96;
+    var topL = 0.13, topR = 0.87, botL = 0.30, botR = 0.72;
+    var aspectGuess = (topR-topL) / (palmBottom-palmTop);
+    var cols = Math.max(1, Math.round(Math.sqrt(palmCount * aspectGuess)));
+    var rows = Math.max(1, Math.ceil(palmCount / cols));
+    var palmPts = [];
+    for (var r = 0; r < rows; r++){
+      var v = palmTop + ((r + 0.5) / rows) * (palmBottom - palmTop);
+      var left = topL + (botL - topL) * ((v - palmTop)/(palmBottom-palmTop));
+      var right = topR + (botR - topR) * ((v - palmTop)/(palmBottom-palmTop));
+      for (var c = 0; c < cols; c++){
+        var u = left + ((c + 0.5) / cols) * (right - left);
+        palmPts.push({ u: u, v: v });
+      }
+    }
+    palmPts = palmPts.slice(0, palmCount);
+    pts = pts.concat(palmPts);
+    while (pts.length < N){ pts.push({ u: 0.5, v: 0.75 }); }
+    pts = pts.slice(0, N);
+    return pts.map(function(p){
+      return { x: bd.minX + p.u * bd.bw * 2, y: bd.minY + p.v * bd.bh * 2 };
+    });
+  }
+
+  function makeSlots(){
+    var bd = boundsFor(formation);
+    var slots = [];
+    if (formation === 'grid'){
+      var w2 = bd.bw * 2, h2 = bd.bh * 2;
+      var cols = Math.ceil(Math.sqrt(N * (w2 / h2)));
+      var rows = Math.ceil(N / cols);
+      var cellW = w2 / (cols + 1), cellH = h2 / (rows + 1);
+      for (var i = 0; i < N; i++){
+        var col = i % cols, row = Math.floor(i / cols);
+        slots.push({ x: bd.minX + (col + 1) * cellW, y: bd.minY + (row + 1) * cellH });
+      }
+    } else if (formation === 'circle'){
+      var radius = Math.min(bd.bw, bd.bh) * 0.9;
+      for (var i = 0; i < N; i++){
+        var ang = (i / N) * Math.PI * 2;
+        slots.push({ x: bd.cx + Math.cos(ang) * radius, y: bd.cy + Math.sin(ang) * radius });
+      }
+    } else if (formation === 'line'){
+      for (var i = 0; i < N; i++){
+        slots.push({ x: bd.minX + (N <= 1 ? bd.bw : (i / (N - 1)) * bd.bw * 2), y: bd.cy });
+      }
+    } else if (formation === 'hand'){
+      slots = handSlots(bd);
+    } else {
+      for (var i = 0; i < N; i++){ slots.push(null); }
+    }
+    return slots;
+  }
+
+  function buildSlotsAndAssign(){
+    if (!bots.length) return;
+    var slots = makeSlots();
+    if (formation === 'search'){
+      for (var i = 0; i < bots.length; i++){ bots[i].tx = null; bots[i].ty = null; }
+      return;
+    }
+    var used = new Array(slots.length).fill(false);
+    for (var i = 0; i < bots.length; i++){
+      var b = bots[i];
+      var bestJ = -1, bestD = Infinity;
+      for (var j = 0; j < slots.length; j++){
+        if (used[j]) continue;
+        var dx = slots[j].x - b.x, dy = slots[j].y - b.y;
+        var d = dx*dx + dy*dy;
+        if (d < bestD){ bestD = d; bestJ = j; }
+      }
+      if (bestJ >= 0){
+        used[bestJ] = true;
+        b.tx = slots[bestJ].x;
+        b.ty = slots[bestJ].y;
+      }
+    }
+  }
+
+  countInput.addEventListener('input', function(){
+    N = parseInt(this.value, 10);
+    countOut.textContent = N;
+    initBots();
+  });
+  speedInput.addEventListener('input', function(){
+    speedMul = parseInt(this.value, 10);
+    speedOut.textContent = speedMul;
+  });
+  drainInput.addEventListener('input', function(){
+    drainLevel = parseInt(this.value, 10);
+    drainOut.textContent = drainLevel;
+  });
+
+  resize();
+  window.addEventListener('resize', resize);
+  initBots();
+
+  function clampVec(dx, dy, maxLen){
+    var len = Math.sqrt(dx*dx + dy*dy);
+    if (len > maxLen && len > 0){
+      return [dx / len * maxLen, dy / len * maxLen];
+    }
+    return [dx, dy];
+  }
+
+  function battColor(pct){
+    if (pct > 55) return '#5DCAA5';
+    if (pct > 25) return '#F0C868';
+    return '#E8654F';
+  }
+
+  // Time compression: 1 real second = TIME_SCALE simulated seconds, so a
+  // realistic multi-hour battery cycle is watchable in real time instead
+  // of literally taking hours.
+  var TIME_SCALE = 60;
+  var simElapsed = 0; // simulated seconds since load/reset
+
+  // Calibrated so that at the default drain slider value, a bot running
+  // flat-out depletes a full battery in about 2 simulated hours (7200
+  // simulated seconds). Drain still scales with the slider and with how
+  // fast the bot is actually moving, same as before.
+  var DRAIN_K = 100 / (4 * 14400); // ~0.001736 %/simulated-second per drain-level unit at full speed (~4 sim-hour runtime at default slider)
+
+  // Charging is deliberately much slower than a scene-cut would suggest,
+  // but still far shorter than the multi-hour run time (like real fast
+  // charging vs. drive time). ~1200 simulated seconds (20 sim-minutes) to
+  // go from ~20% to 95%.
+  var CHARGE_RATE = 75 / 1200; // %/simulated-second
+
+  // Regenerative braking recovers a genuinely tiny amount of energy for
+  // something this small and light - scaled down proportionally to the
+  // slower, more realistic drain rate above (previously this was wildly
+  // oversized relative to real microbot dynamics).
+  var REGEN_CAP = 0.0014;
+  var REGEN_COEFF = 0.00004;
+
+  function formatSimTime(sec){
+    var totalMin = Math.floor(sec / 60);
+    var h = Math.floor(totalMin / 60);
+    var m = totalMin % 60;
+    return h + 'h ' + (m < 10 ? '0' : '') + m + 'm';
+  }
+
+  var last = performance.now();
+  function tick(now){
+    var dt = Math.min((now - last) / 1000, 0.033);
+    last = now;
+    var dtSim = dt * TIME_SCALE;
+    simElapsed += dtSim;
+    var w = W || 800, h = H || 340;
+    var bd = boundsFor(formation);
+    var maxSpeed = speedMul * 20;
+    var collideD = botRadius * 2.3;
+    var drainRate = drainLevel * DRAIN_K;
+    var qAnchor = queueAnchor();
+
+    for (var i = 0; i < bots.length; i++){
+      var b = bots[i];
+      if (b.battery < 20 && !b.charging && !b.waiting){
+        var freeSlot = slotOccupant.indexOf(null);
+        if (freeSlot >= 0){
+          slotOccupant[freeSlot] = b.id;
+          b.dockSlot = freeSlot;
+          b.charging = true;
+        } else {
+          b.waiting = true;
+        }
+      }
+      if (b.waiting){
+        var freeSlot2 = slotOccupant.indexOf(null);
+        if (freeSlot2 >= 0){
+          slotOccupant[freeSlot2] = b.id;
+          b.dockSlot = freeSlot2;
+          b.charging = true;
+          b.waiting = false;
+        }
+      }
+    }
+
+    for (var i = 0; i < bots.length; i++){
+      var b = bots[i];
+      var dx = 0, dy = 0;
+      var atSlot = false;
+
+      if (b.charging){
+        var sp = dockSlotPos(b.dockSlot);
+        var ddx = sp.x - b.x, ddy = sp.y - b.y;
+        var ddist = Math.sqrt(ddx*ddx + ddy*ddy) || 1;
+        atSlot = ddist < botRadius * 1.8;
+        if (atSlot){
+          var holdPull = Math.min(ddist * 1.5, maxSpeed * 0.5);
+          dx = (ddx / ddist) * holdPull;
+          dy = (ddy / ddist) * holdPull;
+          b.battery = Math.min(100, b.battery + dtSim * CHARGE_RATE);
+          if (b.battery >= 95){
+            b.charging = false;
+            slotOccupant[b.dockSlot] = null;
+            b.dockSlot = -1;
+          }
+        } else {
+          var pull = Math.min(ddist * 3, maxSpeed * 1.2);
+          dx = (ddx / ddist) * pull;
+          dy = (ddy / ddist) * pull;
+        }
+      } else if (b.waiting){
+        var qdx = qAnchor.x - b.x, qdy = qAnchor.y - b.y;
+        var qdist = Math.sqrt(qdx*qdx + qdy*qdy) || 1;
+        var qpull = Math.min(qdist * 2.5, maxSpeed);
+        dx = (qdx / qdist) * qpull;
+        dy = (qdy / qdist) * qpull;
+      } else if (formation === 'search'){
+        b.wobbleAng += dt * (0.5 + (i % 5) * 0.08);
+        var tx = bd.cx + Math.cos(b.wobbleAng) * bd.bw * (0.4 + 0.6 * b.wobbleR);
+        var ty = bd.cy + Math.sin(b.wobbleAng * 1.3) * bd.bh * (0.4 + 0.6 * b.wobbleR);
+        dx = tx - b.x; dy = ty - b.y;
+        var dist0 = Math.sqrt(dx*dx + dy*dy) || 1;
+        var pull0 = Math.min(dist0 * 2, maxSpeed);
+        dx = (dx / dist0) * pull0;
+        dy = (dy / dist0) * pull0;
+      } else {
+        dx = (b.tx - b.x);
+        dy = (b.ty - b.y);
+        var dist = Math.sqrt(dx*dx + dy*dy) || 1;
+        var pull = Math.min(dist * 3, maxSpeed * 1.2);
+        dx = (dx / dist) * pull;
+        dy = (dy / dist) * pull;
+      }
+
+      for (var j = 0; j < bots.length; j++){
+        if (j === i) continue;
+        var o = bots[j];
+        var sx = b.x - o.x, sy = b.y - o.y;
+        var d2 = sx*sx + sy*sy;
+        if (d2 < collideD*collideD && d2 > 0.0001){
+          var d = Math.sqrt(d2);
+          var push = (collideD - d) / collideD * maxSpeed * 2.4;
+          dx += (sx / d) * push;
+          dy += (sy / d) * push;
+        }
+      }
+
+      var clamped = clampVec(dx, dy, maxSpeed * 1.6);
+      b.vx = b.vx * 0.65 + clamped[0] * 0.35;
+      b.vy = b.vy * 0.65 + clamped[1] * 0.35;
+      var vClamped = clampVec(b.vx, b.vy, maxSpeed * (atSlot ? 0.9 : 1.3));
+      b.vx = vClamped[0];
+      b.vy = vClamped[1];
+
+      var curSpeed = Math.sqrt(b.vx*b.vx + b.vy*b.vy);
+      if (!atSlot){
+        var decel = b.prevSpeed - curSpeed;
+        if (decel > 2){
+          var regenAmt = Math.min(REGEN_CAP, decel * REGEN_COEFF);
+          b.battery = Math.min(100, b.battery + regenAmt);
+          totalRegen += regenAmt;
+          b.regenFlash = 1;
+        }
+        b.battery -= drainRate * (curSpeed / (maxSpeed || 1)) * dtSim;
+        b.battery = Math.max(0, b.battery);
+      }
+      b.prevSpeed = curSpeed;
+      b.regenFlash = Math.max(0, b.regenFlash - dt * 2);
+
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      b.x = Math.max(botRadius + 2, Math.min(w - botRadius - 2, b.x));
+      b.y = Math.max(botRadius + 2, Math.min(h - botRadius - 2, b.y));
+    }
+
+    ctx.clearRect(0, 0, w, h);
+
+    var padR = botRadius * 1.15;
+    ctx.strokeStyle = '#378ADD';
+    for (var s = 0; s < DOCK_SLOTS; s++){
+      var sp2 = dockSlotPos(s);
+      ctx.fillStyle = 'rgba(55,138,221,0.12)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(sp2.x, sp2.y, padR, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      if (slotOccupant[s] === null){
+        ctx.fillStyle = '#378ADD';
+        ctx.font = Math.max(9, botRadius * 0.9) + 'px system-ui, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('\u26A1', sp2.x, sp2.y);
+      }
+    }
+
+    var battSum = 0, chargingCount = 0, waitingCount = 0;
+    for (var i = 0; i < bots.length; i++){
+      var b = bots[i];
+      battSum += b.battery;
+      if (b.charging) chargingCount++;
+      if (b.waiting) waitingCount++;
+
+      var ringR = botRadius + 2.5;
+      ctx.beginPath();
+      ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+      ctx.lineWidth = 2;
+      ctx.arc(b.x, b.y, ringR, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.strokeStyle = battColor(b.battery);
+      ctx.lineWidth = 2;
+      ctx.arc(b.x, b.y, ringR, -Math.PI / 2, -Math.PI / 2 + (b.battery / 100) * Math.PI * 2);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, botRadius, 0, Math.PI * 2);
+      ctx.fillStyle = b.waiting ? '#F0A868' : (b.special ? '#7F77DD' : '#4FD8E8');
+      ctx.fill();
+
+      if (b.regenFlash > 0){
+        ctx.beginPath();
+        ctx.strokeStyle = 'rgba(93,202,165,' + b.regenFlash + ')';
+        ctx.lineWidth = 2;
+        ctx.arc(b.x, b.y, ringR + 3, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+
+    var avgBatt = battSum / bots.length;
+    statBatt.textContent = Math.round(avgBatt) + '%';
+    statCharging.textContent = chargingCount + ' / ' + DOCK_SLOTS;
+    statQueue.textContent = waitingCount;
+    statRegen.textContent = (Math.min(999, totalRegen)).toFixed(2) + '%';
+    statSimtime.textContent = formatSimTime(simElapsed);
+
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
